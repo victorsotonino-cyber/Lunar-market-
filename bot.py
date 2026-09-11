@@ -5,8 +5,8 @@ Características:
 - Lee token desde DISCORD_TOKEN (env var)
 - Persistencia en SQLite (tickets.db)
 - Comandos con prefijo: !ticket setup/create/list/claim/close/add/remove/info/rename/panel/transcript
-- Panel por reacciones (configurable)
-- Opcional: sincronización rápida de slash commands si GUILD_ID está en env
+- Panel con botones en lugar de reacciones
+- Botones en cada ticket: Reclamar y Cerrar
 """
 
 import os
@@ -130,6 +130,132 @@ async def list_tickets(guild_id, where_clause=None, params=()):
         rows = await cur.fetchall()
         return rows
 
+# ----- UI Views (Buttons) -----
+class TicketControlView(discord.ui.View):
+    def __init__(self, ticket_id: int, *, timeout: Optional[float] = None):
+        super().__init__(timeout=timeout)
+        self.ticket_id = ticket_id
+
+    @discord.ui.button(label="Reclamar", style=discord.ButtonStyle.primary, custom_id="ticket_claim")
+    async def claim_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Check if staff
+        member = interaction.user
+        if not is_staff(member):
+            await interaction.response.send_message("Solo staff puede reclamar tickets.", ephemeral=True)
+            return
+        # find ticket by channel
+        ticket = await get_ticket_by_channel(interaction.channel.id)
+        if not ticket:
+            await interaction.response.send_message("Este canal no parece ser un ticket.", ephemeral=True)
+            return
+        if ticket[6]:
+            await interaction.response.send_message("Este ticket ya fue reclamado.", ephemeral=True)
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE tickets SET claimed_by=? WHERE id=?", (member.id, ticket[0]))
+            await db.commit()
+        await interaction.response.send_message(f"✅ {member.mention} reclamó este ticket.", ephemeral=False)
+
+    @discord.ui.button(label="Cerrar ticket", style=discord.ButtonStyle.danger, custom_id="ticket_close")
+    async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Allow owner, staff or admin to close
+        ticket = await get_ticket_by_channel(interaction.channel.id)
+        if not ticket:
+            await interaction.response.send_message("Este canal no parece ser un ticket.", ephemeral=True)
+            return
+        author = interaction.user
+        if author.id != ticket[3] and not is_staff(author) and not author.guild_permissions.administrator:
+            await interaction.response.send_message("Solo el creador, staff o admin puede cerrar este ticket.", ephemeral=True)
+            return
+        reason = "Cerrado vía botón"
+        closed_at = datetime.utcnow().isoformat()
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE tickets SET status='closed', closed_at=?, close_reason=? WHERE id=?", (closed_at, reason, ticket[0]))
+            await db.commit()
+        try:
+            # rename channel
+            await interaction.channel.edit(name=f"closed-{interaction.channel.name}")
+            owner = interaction.guild.get_member(ticket[3])
+            if owner:
+                await interaction.channel.set_permissions(owner, send_messages=False, read_message_history=True, view_channel=True)
+        except Exception:
+            pass
+        await send_transcript_to_logs(interaction.channel, ticket)
+        await interaction.response.send_message("🔒 Ticket cerrado.", ephemeral=False)
+        # disable buttons
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self, categories: dict, *, timeout: Optional[float] = None):
+        super().__init__(timeout=timeout)
+        self.categories = categories
+        # create a button per category (max 25 buttons per view)
+        for key, info in categories.items():
+            label = str(key)
+            emoji = info.get('emoji')
+            # discord.Button emoji expects Emoji/PartialEmoji or str, but sending custom emoji as label is fine too
+            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, custom_id=f"panel_cat:{key}")
+            # attach callback
+            async def make_callback(k):
+                async def callback(interaction: discord.Interaction):
+                    await self.handle_create(interaction, k)
+                return callback
+            # bind callback
+            btn.callback = asyncio.get_event_loop().run_until_complete(make_callback(key))
+            self.add_item(btn)
+
+    async def handle_create(self, interaction: discord.Interaction, category_key: str):
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        user = interaction.user
+        # reuse create logic (similar to cmd_create)
+        cat = category_key
+        reason = f"Creado desde panel (botón) por {user}"
+        # category object
+        cat_obj = None
+        cat_id = os.getenv('TICKET_CATEGORY_ID') or cfg.get('ticket_category_id')
+        if cat_id:
+            try:
+                cat_obj = guild.get_channel(int(cat_id))
+                if not isinstance(cat_obj, discord.CategoryChannel):
+                    cat_obj = None
+            except Exception:
+                cat_obj = None
+        if not cat_obj:
+            cat_name = cfg.get('ticket_category_name','Lunar Market Tickets')
+            cat_obj = discord.utils.get(guild.categories, name=cat_name)
+            if not cat_obj:
+                cat_obj = await guild.create_category(cat_name, reason='Creando categoría para tickets')
+        # permissions
+        overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False), guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)}
+        for rid in cfg.get('staff_role_ids',[]) or []:
+            try:
+                role = guild.get_role(int(rid))
+                if role:
+                    overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+            except Exception:
+                pass
+        overwrites[user] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+        safe_user = user.name.lower().replace(' ','-')[:20]
+        channel = await guild.create_text_channel(f"ticket-{safe_user}", overwrites=overwrites, category=cat_obj, topic=f"Ticket {cat} creado por {user}")
+        tid = await create_ticket_record(guild.id, channel.id, user.id, cat, reason)
+        tag_role = os.getenv('TAG_ON_CREATE_ROLE_ID') or cfg.get('tag_on_create_role_id')
+        mention = f"<@&{tag_role}>" if tag_role else ''
+        cat_info = cfg.get('categories',{}).get(cat,{})
+        embed = discord.Embed(title=f"{cat_info.get('emoji','🛎️')} Ticket #{tid} — {cat}", description=f"{cat_info.get('desc','')}\n\n• Creado por: {user.mention}\n• Razón: {reason}", color=0x7B68EE, timestamp=datetime.utcnow())
+        control_view = TicketControlView(tid)
+        await channel.send(content=f"{mention} {user.mention}", embed=embed, view=control_view)
+        try:
+            await user.send(f"✅ Tu ticket fue creado en **{guild.name}**: {channel.mention}")
+        except Exception:
+            pass
+        await interaction.followup.send(f"✅ Ticket creado: {channel.mention}", ephemeral=True)
+
 # ----- Bot events & commands -----
 @bot.event
 async def on_ready():
@@ -177,7 +303,7 @@ async def ticket_root(ctx, sub: Optional[str] = None, *args):
     else:
         await ctx.send("Subcomando desconocido. Usa `!ticket` para ver ayuda.")
 
-# Implementación de subcomandos (resumida y segura)
+# Implementación de subcomandos (modulares)
 async def cmd_setup(ctx: commands.Context):
     if not ctx.author.guild_permissions.administrator:
         return await ctx.send("Necesitas permisos de administrador para ejecutar esto.")
@@ -206,24 +332,13 @@ async def cmd_setup(ctx: commands.Context):
     cats = cfg.get("categories", {})
     lines = [f"{v.get('emoji','🛎️')} **{k}** — {v.get('desc','')}" for k,v in cats.items()]
     embed = discord.Embed(title="🎟️ Lunar Market — Crear un Ticket", description="\n".join(lines), color=0x6A5ACD)
-    embed.set_footer(text="Reacciona con el emoji correspondiente para crear un ticket.")
-    msg = await panel_channel.send(embed=embed)
-    # añadir reacciones
-    for info in cats.values():
-        emo = info.get('emoji')
-        if not emo:
-            continue
-        try:
-            await msg.add_reaction(emo)
-        except Exception:
-            try:
-                await msg.add_reaction(discord.PartialEmoji.from_str(emo))
-            except Exception:
-                pass
+    embed.set_footer(text="Pulsa el botón correspondiente para crear un ticket.")
+    view = TicketPanelView(cats)
+    msg = await panel_channel.send(embed=embed, view=view)
     # guardar meta
     await set_meta('panel_message_id', str(msg.id))
     await set_meta('panel_channel_id', str(panel_channel.id))
-    await ctx.send(f"Panel creado en {panel_channel.mention}.")
+    await ctx.send(f"Panel creado en {panel_channel.mention} con botones.")
 
 async def cmd_create(ctx: commands.Context, *args):
     if len(args) == 0:
@@ -253,27 +368,26 @@ async def cmd_create(ctx: commands.Context, *args):
         cat_obj = discord.utils.get(guild.categories, name=cat_name)
         if not cat_obj:
             cat_obj = await guild.create_category(cat_name, reason='Creando categoría para tickets')
-    # permisos
+    # permissions
     overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False), guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)}
     for rid in cfg.get('staff_role_ids',[]) or []:
-        role = guild.get_role(int(rid)) if role is not None else None
         try:
+            role = guild.get_role(int(rid))
             if role:
                 overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
         except Exception:
             pass
     overwrites[ctx.author] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
     safe_user = ctx.author.name.lower().replace(' ','-')[:20]
-    # contador simple: use sqlite autoincrement after creation
     channel = await guild.create_text_channel(f"ticket-{safe_user}", overwrites=overwrites, category=cat_obj, topic=f"Ticket {cat} creado por {ctx.author}")
     tid = await create_ticket_record(guild.id, channel.id, ctx.author.id, cat, reason)
-    # mensaje inicial
+    # mensaje inicial con botones
     tag_role = os.getenv('TAG_ON_CREATE_ROLE_ID') or cfg.get('tag_on_create_role_id')
     mention = f"<@&{tag_role}>" if tag_role else ''
     cat_info = cfg.get('categories',{}).get(cat,{})
     embed = discord.Embed(title=f"{cat_info.get('emoji','🛎️')} Ticket #{tid} — {cat}", description=f"{cat_info.get('desc','')}\n\n• Creado por: {ctx.author.mention}\n• Razón: {reason or 'No especificada'}", color=0x7B68EE, timestamp=datetime.utcnow())
-    embed.set_footer(text="Equipo Lunar Market • Responderemos lo antes posible")
-    await channel.send(content=f"{mention} {ctx.author.mention}", embed=embed)
+    control_view = TicketControlView(tid)
+    await channel.send(content=f"{mention} {ctx.author.mention}", embed=embed, view=control_view)
     await ctx.send(f"Ticket creado: {channel.mention}")
 
 async def cmd_claim(ctx: commands.Context):
@@ -436,29 +550,6 @@ async def cmd_rename(ctx: commands.Context, *args):
     except Exception as e:
         await ctx.send(f'No pude renombrar el canal: {e}')
 
-async def cmd_panel(ctx: commands.Context):
-    if not ctx.author.guild_permissions.administrator:
-        return await ctx.send('Necesitas permisos de administrador para crear/actualizar el panel.')
-    cats = cfg.get('categories',{})
-    lines = [f"{v.get('emoji','🛎️')} **{k}** — {v.get('desc','')}" for k,v in cats.items()]
-    embed = discord.Embed(title='🎟️ Lunar Market — Crear un Ticket', description='\n'.join(lines), color=0x6A5ACD)
-    embed.set_footer(text='Reacciona con el emoji correspondiente para crear un ticket en esa categoría.')
-    msg = await ctx.send(embed=embed)
-    for info in cats.values():
-        emo = info.get('emoji')
-        if not emo:
-            continue
-        try:
-            await msg.add_reaction(emo)
-        except Exception:
-            try:
-                await msg.add_reaction(discord.PartialEmoji.from_str(emo))
-            except Exception:
-                pass
-    await set_meta('panel_message_id', str(msg.id))
-    await set_meta('panel_channel_id', str(ctx.channel.id))
-    await ctx.send('Panel creado/actualizado.')
-
 async def cmd_transcript(ctx: commands.Context):
     ticket = await get_ticket_by_channel(ctx.channel.id)
     if not ticket:
@@ -498,77 +589,11 @@ async def send_transcript_to_logs(channel: discord.TextChannel, ticket_row, noti
     if notify_channel:
         await channel.send(f"Transcript enviado a {log_channel.mention}.")
 
-# Listener para reacciones en el panel
+# Listener de reacciones (ya no necesario, pero mantenido para compatibilidad)
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    if payload.user_id == bot.user.id:
-        return
-    panel_id = await get_meta('panel_message_id')
-    if not panel_id:
-        return
-    if payload.message_id != int(panel_id):
-        return
-    guild = bot.get_guild(payload.guild_id)
-    member = guild.get_member(payload.user_id)
-    if not member:
-        return
-    emoji_str = str(payload.emoji)
-    chosen = None
-    for key, info in cfg.get('categories', {}).items():
-        if info.get('emoji') == emoji_str:
-            chosen = key
-            break
-        # match by id if custom emoji
-        try:
-            if '<:' in info.get('emoji','') and payload.emoji.id and str(payload.emoji.id) in info.get('emoji'):
-                chosen = key
-                break
-        except Exception:
-            pass
-    if not chosen:
-        return
-    # crear ticket similar a cmd_create
-    guild_obj = guild
-    reason = f"Creado desde panel por reacción {emoji_str}"
-    # reuse cmd_create logic but simpler
-    cat = chosen
-    # category channel
-    cat_obj = None
-    cat_id = os.getenv('TICKET_CATEGORY_ID') or cfg.get('ticket_category_id')
-    if cat_id:
-        try:
-            cat_obj = guild_obj.get_channel(int(cat_id))
-            if not isinstance(cat_obj, discord.CategoryChannel):
-                cat_obj = None
-        except Exception:
-            cat_obj = None
-    if not cat_obj:
-        cat_name = cfg.get('ticket_category_name','Lunar Market Tickets')
-        cat_obj = discord.utils.get(guild_obj.categories, name=cat_name)
-        if not cat_obj:
-            cat_obj = await guild_obj.create_category(cat_name, reason='Creando categoría para tickets')
-    overwrites = {guild_obj.default_role: discord.PermissionOverwrite(view_channel=False), guild_obj.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)}
-    for rid in cfg.get('staff_role_ids',[]) or []:
-        try:
-            role = guild_obj.get_role(int(rid))
-            if role:
-                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-        except Exception:
-            pass
-    user = member
-    overwrites[user] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-    safe_user = user.name.lower().replace(' ','-')[:20]
-    channel = await guild_obj.create_text_channel(f"ticket-{safe_user}", overwrites=overwrites, category=cat_obj, topic=f"Ticket {cat} creado por {user}")
-    tid = await create_ticket_record(guild_obj.id, channel.id, user.id, cat, reason)
-    tag_role = os.getenv('TAG_ON_CREATE_ROLE_ID') or cfg.get('tag_on_create_role_id')
-    mention = f"<@&{tag_role}>" if tag_role else ''
-    cat_info = cfg.get('categories',{}).get(cat,{})
-    embed = discord.Embed(title=f"{cat_info.get('emoji','🛎️')} Ticket #{tid} — {cat}", description=f"{cat_info.get('desc','')}\n\n• Creado por: {user.mention}\n• Razón: {reason}", color=0x7B68EE, timestamp=datetime.utcnow())
-    await channel.send(content=f"{mention} {user.mention}", embed=embed)
-    try:
-        await user.send(f"✅ Tu ticket fue creado en **{guild_obj.name}**: {channel.mention}")
-    except Exception:
-        pass
+    # legacy support: ignore panel reactions as we use buttons
+    return
 
 # Run
 if __name__ == '__main__':
