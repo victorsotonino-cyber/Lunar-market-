@@ -298,17 +298,50 @@ class TicketControlView(discord.ui.View):
             pass
 
 class TicketPanelView(discord.ui.View):
-    def __init__(self, categories: dict, *, timeout: Optional[float] = None):
+    def __init__(self, categories: dict, buttons_per_row: int = 4, *, timeout: Optional[float] = None):
         super().__init__(timeout=timeout)
         self.categories = categories
-        # create a button per category (max 25 buttons per view)
+
+        # Filtrar solo categorías habilitadas y ordenar por 'order'
+        visible = []
         for key, info in categories.items():
-            label = str(key)
-            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, custom_id=f"panel_cat:{key}")
-            # bind a simple callback closure
+            if info.get("enabled", True):
+                visible.append((info.get("order", 999), key, info))
+        visible.sort(key=lambda t: (t[0], t[1]))
+
+        for idx, (_ord, key, info) in enumerate(visible):
+            label = info.get("label", key).capitalize()
+            emoji_raw = info.get("emoji")
+
+            # construir objeto emoji: PartialEmoji para custom (<:name:id>) o string para unicode
+            emoji_obj = None
+            if emoji_raw:
+                try:
+                    if isinstance(emoji_raw, str) and (emoji_raw.startswith("<:") or emoji_raw.startswith("<a:")):
+                        emoji_obj = discord.PartialEmoji.from_str(emoji_raw)
+                    else:
+                        emoji_obj = emoji_raw
+                except Exception:
+                    emoji_obj = emoji_raw
+
+            row = idx // buttons_per_row
+            btn = discord.ui.Button(
+                label=label,
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"panel_cat:{key}",
+                row=row
+            )
+
+            if emoji_obj:
+                try:
+                    btn.emoji = emoji_obj
+                except Exception:
+                    pass
+
             async def callback(interaction: discord.Interaction, k=key):
                 await self.handle_create(interaction, k)
             btn.callback = callback
+
             self.add_item(btn)
 
     async def handle_create(self, interaction: discord.Interaction, category_key: str):
@@ -434,7 +467,7 @@ async def cmd_setup(ctx: commands.Context):
     if not panel_channel:
         panel_channel = await guild.create_text_channel(panel_name, category=cat, reason="Panel de tickets")
     cats = cfg.get("categories", {})
-    lines = [f"{v.get('emoji','🛎️')} **{k}** — {v.get('desc','')}" for k,v in cats.items()]
+    lines = [f"{v.get('emoji','🛎️')} **{k}** — {v.get('desc','')}" for k,v in cats.items() if v.get('enabled', True)]
     embed = discord.Embed(title="🎟️ Lunar Market — Crear un Ticket", description="\n".join(lines), color=0x6A5ACD)
     embed.set_footer(text="Pulsa el botón correspondiente para crear un ticket.")
     view = TicketPanelView(cats)
