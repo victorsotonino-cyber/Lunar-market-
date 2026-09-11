@@ -1,0 +1,7 @@
+.env
+tickets.db
+__pycache__/
+transcripts/
+*.pyc
+.idea/
+.vscode/
