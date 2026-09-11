@@ -1,0 +1,20 @@
+{
+  "ticket_category_name": "Lunar Market Tickets",
+  "ticket_category_id": null,
+  "panel_channel_id": null,
+  "panel_message_id": null,
+  "staff_role_ids": [1451204772672831564],
+  "tag_on_create_role_id": 1451204772672831564,
+  "categories": {
+    "soporte": { "emoji": "🛎️", "desc": "Ayuda general con compras, problemas técnicos o preguntas sobre la tienda." },
+    "tienda": { "emoji": "🛍️", "desc": "Consultas relacionadas con productos, pagos, envíos o inventario." },
+    "postulaciones": { "emoji": "🧑‍💼", "desc": "Formularios y seguimiento para postulaciones a staff." },
+    "reclaim": { "emoji": "🔁", "desc": "Reclamaciones / devolución de artículos o errores en entregas." },
+    "reporte": { "emoji": "🚨", "desc": "Reportes de usuarios, fraudes o comportamientos inapropiados." },
+    "regalo": { "emoji": "<:regalo_cherrybox:1488944546510409911>", "desc": "Consultas sobre cajas/regalos." },
+    "mantenimiento": { "emoji": "<:md_mantenimiento:1489283103242457261>", "desc": "Avisos o dudas sobre mantenimientos." },
+    "dueo": { "emoji": "<:Dueo:1488948495447757021>", "desc": "Contacto directo con responsables / dueños." },
+    "peruano": { "emoji": "<:PERUANO:1488948529891381268>", "desc": "Consultas o eventos relacionados con la comunidad Peruana." },
+    "viperfinder": { "emoji": "<:viperfinder_viperfinde_558:1489283055746027760>", "desc": "Soporte para ViperFinder / herramientas relacionadas." }
+  }
+}
